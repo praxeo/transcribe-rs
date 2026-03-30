@@ -21,6 +21,7 @@ pub enum Quantization {
 
 pub mod canary;
 pub mod gigaam;
+pub mod medasr;
 pub mod moonshine;
 pub mod parakeet;
 pub mod sense_voice;
