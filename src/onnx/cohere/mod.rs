@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ndarray::{Array2, ArrayD, Ix3, IxDyn};
+use ndarray::{Array2, ArrayD, ArrayView2, Ix3, IxDyn};
 use ort::session::Session;
 use ort::session::SessionInputValue;
 use ort::value::DynValue;
@@ -69,11 +69,18 @@ impl CohereModel {
         let vocab_path =
             resolve_model_file(model_dir, &["tokens.txt", "vocabulary.txt"], "tokens.txt")?;
 
+        // OPTIMIZATION 3: Asymmetric Threading
         log::info!("Loading Cohere encoder from {:?}...", encoder_path);
-        let encoder = session::create_session(&encoder_path)?;
+        let encoder = ort::session::Session::builder()?
+            .with_intra_threads(10)? // Heavy parallel matrix math, use many threads
+            .with_inter_threads(2)?
+            .commit_from_file(&encoder_path)?;
 
         log::info!("Loading Cohere decoder from {:?}...", decoder_path);
-        let decoder = session::create_session(&decoder_path)?;
+        let decoder = ort::session::Session::builder()?
+            .with_intra_threads(2)? // Single token decoding, limit threads to avoid contention
+            .with_inter_threads(1)?
+            .commit_from_file(&decoder_path)?;
 
         let (vocab, _) = load_vocab(&vocab_path)?;
         let token_to_id = vocab
@@ -144,10 +151,16 @@ impl CohereModel {
         prompt_ids: &[i64],
         max_new_tokens: usize,
     ) -> Result<String, TranscribeError> {
-        let audio = Array2::from_shape_vec((1, samples.len()), samples.to_vec())?.into_dyn();
+        // OPTIMIZATION 6: Silence early exit
+        if is_silence(samples, 0.01) {
+            return Ok(String::new());
+        }
+
+        // OPTIMIZATION 5: ArrayView zero-copy for audio
+        let audio = ArrayView2::from_shape((1, samples.len()), samples)?.into_dyn();
         let (cross_k, cross_v) = {
             let mut encoder_outputs = self.encoder.run(vec![(
-                Cow::Owned(self.encoder_input_name.clone()),
+                Cow::Borrowed(self.encoder_input_name.as_str()), // Cow::Borrowed zero-alloc
                 ort::value::Value::from_array(audio)?.into_dyn(),
             )])?;
             let cross_k = remove_output(&mut encoder_outputs, "n_layer_cross_k")?;
@@ -193,7 +206,9 @@ impl CohereModel {
 
         for _ in 0..max_new_tokens {
             let n_tokens = current_tokens.len();
-            let tokens = Array2::from_shape_vec((1, n_tokens), current_tokens.clone())?.into_dyn();
+            
+            // Zero-copy view of current tokens
+            let tokens = ArrayView2::from_shape((1, n_tokens), &current_tokens)?.into_dyn();
             let offset_tensor = ndarray::arr0(offset).into_dyn();
 
             // Build inputs: move self caches (replaced from output below),
@@ -406,4 +421,10 @@ fn remove_output(
     outputs
         .remove(name)
         .ok_or_else(|| TranscribeError::Inference(format!("Missing expected output: {name}")))
+}
+
+fn is_silence(samples: &[f32], threshold: f32) -> bool {
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    let rms = (sum_sq / samples.len() as f32).sqrt();
+    rms < threshold
 }
